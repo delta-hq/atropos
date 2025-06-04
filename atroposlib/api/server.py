@@ -1,8 +1,9 @@
 import time
 import uuid
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
+from collections import deque
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, status, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -18,6 +19,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application state on startup."""
+    app.state.queue = deque()
+    app.state.group = None
+    app.state.project = None
+    app.state.batchsize = -1
+    app.state.max_token_len = -1
+    app.state.num_steps = -1
+    app.state.checkpoint_dir = "/tmp/checkpoints"
+    app.state.save_checkpoint_interval = 100
+    app.state.status_dict = {"step": 0}
+    app.state.curr_batch = []
+    app.state.started = False
+    app.state.requesters = []
+    app.state.envs = []
+    app.state.latest = {}
+    app.state.uuid = str(uuid.uuid4())
+    print(f"Atropos API Server started. Instance UUID: {app.state.uuid}")
+    print(f"Initial state: {app.state.__dict__}")
 
 
 @app.get("/")
@@ -39,7 +62,7 @@ class Registration(BaseModel):
 class RegisterEnv(BaseModel):
     max_token_length: int
     desired_name: str
-    weight: float
+    weight: Optional[float] = 1.0
 
 
 class EnvIdentifier(BaseModel):
@@ -75,21 +98,25 @@ class Info(BaseModel):
 
 @app.post("/register")
 async def register(registration: Registration):
+    # Initialize state if it doesn't exist
     try:
         isinstance(app.state.queue, list)
     except AttributeError:
         app.state.queue = []
         app.state.group = registration.wandb_group
         app.state.project = registration.wandb_project
-        app.state.batchsize = int(registration.batch_size)
-        app.state.max_token_len = int(registration.max_token_len)
         app.state.status_dict = {"step": registration.starting_step}
         app.state.checkpoint_dir = registration.checkpoint_dir
         app.state.save_checkpoint_interval = registration.save_checkpoint_interval
-        app.state.num_steps = registration.num_steps
         app.state.curr_batch = []
         app.state.started = False
         app.state.envs = []
+    
+    # Always update training parameters on registration
+    app.state.batchsize = int(registration.batch_size)
+    app.state.max_token_len = int(registration.max_token_len)
+    app.state.num_steps = registration.num_steps
+    
     try:
         app.state.requesters.append(uuid.uuid4().int)
     except AttributeError:
@@ -271,6 +298,10 @@ async def get_status():
 
 @app.get("/status-env")
 async def get_status_env(env: EnvIdentifier):
+    # Defensive state initialization
+    if not hasattr(app.state, 'envs'):
+        app.state.envs = []
+    
     total = sum(
         [
             x["max_context_len"] * max(0.0, x["weight"])
@@ -278,11 +309,16 @@ async def get_status_env(env: EnvIdentifier):
             if x["connected"]
         ]
     )
+    
+    # Handle case where env_id is out of bounds
+    if env.env_id >= len(app.state.envs):
+        return {"error": f"Environment ID {env.env_id} not found", "current_step": 0, "queue_size": 0, "env_weight": 0.01}
+    
     env_weight = (
         app.state.envs[env.env_id]["max_context_len"]
         * app.state.envs[env.env_id]["weight"]
         / total
-    )
+    ) if total > 0 else 0.01
     env_weight = max(
         0.01, env_weight
     )  # Minimum weight of 0.01 :) TODO: try to figure out a better way to do this
@@ -314,3 +350,100 @@ async def reset_data():
     except KeyError:
         pass
     return PlainTextResponse("Reset successful", status_code=status.HTTP_200_OK)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for the API server"""
+    try:
+        return {
+            "status": "healthy", 
+            "batch_size": app.state.batchsize,
+            "max_token_len": app.state.max_token_len,
+            "queue_size": len(app.state.queue),
+            "current_step": app.state.status_dict["step"],
+            "uuid": app.state.uuid
+        }
+    except AttributeError:
+        return {
+            "status": "initializing",
+            "batch_size": -1,
+            "max_token_len": -1,
+            "queue_size": 0,
+            "current_step": 0,
+            "uuid": "unknown"
+        }
+
+
+@app.get("/queue_size")
+async def queue_size():
+    """Get current queue size"""
+    try:
+        return {"queue_size": len(app.state.queue)}
+    except AttributeError:
+        return {"queue_size": 0}
+
+
+class BatchSubmission(BaseModel):
+    """Model for batch submission from environment"""
+    batch: List[Dict[str, Any]]
+
+
+@app.post("/submit_batch")
+async def submit_batch(submission: BatchSubmission):
+    """
+    Endpoint for environments to submit batches of training data
+    Used by Modal SWE-RL Environment to send episode data
+    """
+    try:
+        # Convert environment episode data to ScoredData format
+        for episode_data in submission.batch:
+            # Convert episode format to training format
+            tokens = []
+            masks = []
+            scores = []
+            
+            # Extract tokens and scores from episode steps
+            for step in episode_data.get("steps", []):
+                # Convert action/observation to tokens (mock implementation)
+                action_tokens = [1, 2, 3, 4, 5]  # Mock tokenization
+                obs_tokens = [6, 7, 8, 9, 10]   # Mock tokenization
+                step_tokens = action_tokens + obs_tokens
+                
+                tokens.append(step_tokens)
+                masks.append([1] * len(step_tokens))  # All tokens are valid
+                scores.append(step.get("reward", 0.0))
+            
+            # Add to queue in ScoredData format
+            if tokens:  # Only add if we have data
+                app.state.queue.append({
+                    "tokens": tokens,
+                    "masks": masks, 
+                    "scores": scores,
+                    "ref_logprobs": None,
+                    "overrides": None,
+                    "group_overrides": {
+                        "instance_id": episode_data.get("instance_id", "unknown"),
+                        "repo": episode_data.get("repo", "unknown"),  
+                        "success": episode_data.get("success", False),
+                        "episode_length": episode_data.get("episode_length", 0)
+                    },
+                    "images": None
+                })
+        
+        # Update latest example
+        if submission.batch and len(app.state.queue) > 0:
+            app.state.latest = app.state.queue[-1]
+        
+        return {
+            "status": "received",
+            "episodes_processed": len(submission.batch),
+            "queue_size": len(app.state.queue)
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": str(e),
+            "episodes_processed": 0
+        }

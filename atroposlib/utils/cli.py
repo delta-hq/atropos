@@ -2,6 +2,8 @@ import sys
 from typing import Any, Dict, Type
 
 from pydantic import BaseModel, Field, create_model
+from pydantic_cli.core import Cmd
+from pydantic_cli.argparse import FailedExecutionException
 
 
 def get_prefixed_pydantic_model(base_model: BaseModel, prefix: str) -> BaseModel:
@@ -209,8 +211,18 @@ def get_double_dash_flags() -> Dict[str, Any]:
     return flags_dict
 
 
+# Create run_and_exit function for compatibility (not provided in new pydantic-cli)
+def run_and_exit(cmd_instance):
+    """Compatibility function for run_and_exit"""
+    try:
+        cmd_instance.run()
+    except Exception as e:
+        raise FailedExecutionException(str(e))
+
+
 if __name__ == "__main__":
-    from pydantic_cli import Cmd, run_and_exit
+    from pydantic_cli.core import Cmd
+    from pydantic_cli.argparse import FailedExecutionException
     from trajectoryhandler.envs.base import BaseEnvConfig
 
     try:

@@ -5,7 +5,7 @@ import aiohttp
 import openai
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.completion import Completion
-from pydantic_cli import FailedExecutionException
+from pydantic_cli.argparse import FailedExecutionException
 
 from atroposlib.envs.constants import NAMESPACE_SEP, OPENAI_NAMESPACE
 from atroposlib.envs.server_handling.server_baseline import APIServer, APIServerConfig

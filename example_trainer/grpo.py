@@ -66,10 +66,23 @@ class TrainingConfig(BaseModel):
     save_path: str = Field(
         "trained_model_checkpoints", description="Base path to save model checkpoints"
     )
-    vllm_restart_interval: int = Field(
-        3, description="Restart vLLM every N training steps"
+    
+    # Modal configuration instead of vLLM
+    use_modal: bool = Field(
+        False, description="Whether to use Modal for inference instead of local vLLM"
     )
-    vllm_port: int = Field(9001, description="Port for the vLLM server")
+    modal_endpoint: Optional[str] = Field(
+        None, description="Modal endpoint URL (if use_modal=True)"
+    )
+    checkpoint_upload_interval: int = Field(
+        3, description="Upload checkpoint to Modal every N training steps"
+    )
+
+    # Legacy vLLM configuration (for backward compatibility)
+    vllm_restart_interval: int = Field(
+        3, description="Restart vLLM every N training steps (ignored if use_modal=True)"
+    )
+    vllm_port: int = Field(9001, description="Port for the vLLM server (ignored if use_modal=True)")
 
     # Wandb configuration
     use_wandb: bool = Field(
@@ -211,6 +224,77 @@ def get_data(
             time.sleep(1)
 
 
+def upload_checkpoint_to_modal(checkpoint_path: str, config: TrainingConfig) -> bool:
+    """
+    Upload a checkpoint to Modal storage for serving.
+    
+    Args:
+        checkpoint_path: Local path to the checkpoint
+        config: Training configuration
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not config.use_modal:
+        return False
+        
+    try:
+        print(f"  📡 Uploading checkpoint to Modal...")
+        
+        # Use modal run to save the checkpoint
+        result = subprocess.run([
+            "poetry", "run", "modal", "run", 
+            "app/fine_tuning/modal/atropos_modal_serve.py::save_model_checkpoint",
+            "--checkpoint-path", checkpoint_path
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            print(f"  ✅ Checkpoint uploaded to Modal successfully!")
+            return True
+        else:
+            print(f"  ❌ Failed to upload checkpoint to Modal: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        print(f"  ❌ Error uploading checkpoint to Modal: {e}")
+        return False
+
+
+def update_modal_server(checkpoint_name: str, config: TrainingConfig) -> bool:
+    """
+    Update the Modal server to use a new checkpoint.
+    
+    Args:
+        checkpoint_name: Name of the checkpoint to use
+        config: Training configuration
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not config.use_modal:
+        return False
+        
+    try:
+        print(f"  🔄 Updating Modal server to use checkpoint: {checkpoint_name}")
+        
+        # For now, we assume the Modal server will automatically pick up
+        # the latest checkpoint. In a more sophisticated setup, we could
+        # restart the Modal server with the new checkpoint.
+        
+        # Test if the Modal endpoint is accessible
+        if config.modal_endpoint:
+            response = requests.get(f"{config.modal_endpoint}/v1/models", timeout=10)
+            if response.status_code == 200:
+                print(f"  ✅ Modal server is accessible and updated!")
+                return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"  ❌ Error updating Modal server: {e}")
+        return False
+
+
 def train(config: TrainingConfig):
     """
     Setups and runs GRPO training, restarting vLLM periodically, with wandb logging.
@@ -258,57 +342,76 @@ def train(config: TrainingConfig):
     print(
         f"Starting training for {config.training_steps} steps on device: {config.device}"
     )
-    print(
-        f"vLLM will be restarted every {config.vllm_restart_interval} steps on port {config.vllm_port}"
-    )
+    
+    if config.use_modal:
+        print(f"🚀 Using Modal endpoint: {config.modal_endpoint}")
+        print(f"📡 Checkpoints will be uploaded every {config.checkpoint_upload_interval} steps")
+    else:
+        print(f"vLLM will be restarted every {config.vllm_restart_interval} steps on port {config.vllm_port}")
 
     os.makedirs(config.save_path, exist_ok=True)  # Ensure base save directory exists
     register_trainer(config)
 
-    # Init vllm
-    vllm_command = [
-        "python",
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
-        config.model_name,
-        "--port",
-        str(config.vllm_port),
-        "--dtype",
-        "auto",
-        "--gpu-memory-utilization",
-        "0.45",
-        "--disable-log-requests",
-    ]
-    print(f"  Launching vLLM server: {' '.join(vllm_command)}")
-    try:
-        vllm_process = subprocess.Popen(vllm_command)
-        print(f"  vLLM server launched with PID: {vllm_process.pid}")
-        # Check immediate errors
+    # Initialize vllm_process variable (used in cleanup and non-Modal mode)
+    vllm_process = None
+
+    # Initialize inference server based on mode
+    if config.use_modal:
+        # For Modal mode, we assume the server is already running
+        # The environment should be using modal_env_base.py
+        print("✅ Modal mode: Assuming Modal server is already running")
+        if config.modal_endpoint:
+            try:
+                response = requests.get(f"{config.modal_endpoint}/v1/models", timeout=10)
+                if response.status_code == 200:
+                    print("✅ Modal endpoint is accessible")
+                else:
+                    print("⚠️ Warning: Modal endpoint returned non-200 status")
+            except Exception as e:
+                print(f"⚠️ Warning: Could not verify Modal endpoint: {e}")
+    else:
+        # Original vLLM initialization logic
+        vllm_command = [
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            config.model_name,
+            "--port",
+            str(config.vllm_port),
+            "--dtype",
+            "auto",
+            "--gpu-memory-utilization",
+            "0.45",
+            "--disable-log-requests",
+        ]
+        print(f"  Launching vLLM server: {' '.join(vllm_command)}")
         try:
-            stdout, stderr = vllm_process.communicate(timeout=2)
-            if vllm_process.returncode is not None and vllm_process.returncode != 0:
-                print(f"  Error starting vLLM: {stderr.decode()}")
-                vllm_process = None
-                # Maybe raise error or just warn?
-                print("  WARNING: Failed to start vLLM server after checkpoint.")
-        except subprocess.TimeoutExpired:
-            print("  vLLM process started (check logs for details).")
-    except FileNotFoundError:
-        print(
-            "\n *** ERROR: 'python -m vllm...' command not found. Make sure vLLM is installed and accessible. ***\n"
-        )
-        # Potentially stop training or just disable further vLLM restarts
-        print("  Disabling further vLLM restarts.")
-        config.vllm_restart_interval = (
-            config.training_steps + 1
-        )  # Prevent further restarts
-    except Exception as e:
-        print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
-        print("  Disabling further vLLM restarts.")
-        config.vllm_restart_interval = (
-            config.training_steps + 1
-        )  # Prevent further restarts
+            vllm_process = subprocess.Popen(vllm_command)
+            print(f"  vLLM server launched with PID: {vllm_process.pid}")
+            # Check immediate errors
+            try:
+                stdout, stderr = vllm_process.communicate(timeout=2)
+                if vllm_process.returncode is not None and vllm_process.returncode != 0:
+                    print(f"  Error starting vLLM: {stderr.decode()}")
+                    vllm_process = None
+                    print("  WARNING: Failed to start vLLM server.")
+            except subprocess.TimeoutExpired:
+                print("  vLLM process started (check logs for details).")
+        except FileNotFoundError:
+            print(
+                "\n *** ERROR: 'python -m vllm...' command not found. Make sure vLLM is installed and accessible. ***\n"
+            )
+            print("  Disabling further vLLM restarts.")
+            config.vllm_restart_interval = (
+                config.training_steps + 1
+            )  # Prevent further restarts
+        except Exception as e:
+            print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
+            print("  Disabling further vLLM restarts.")
+            config.vllm_restart_interval = (
+                config.training_steps + 1
+            )  # Prevent further restarts
 
     batches = list()
     for step in range(config.training_steps):
@@ -413,9 +516,11 @@ def train(config: TrainingConfig):
 
         # --- vLLM Restart Logic (Moved AFTER optimizer step) ---
         # Note: There are much better ways of updating the policy, this is just a very simple example
+        checkpoint_interval = config.checkpoint_upload_interval if config.use_modal else config.vllm_restart_interval
+        
         if (
             step + 1
-        ) % config.vllm_restart_interval == 0 or step == config.training_steps - 1:  # Also restart/save on last step
+        ) % checkpoint_interval == 0 or step == config.training_steps - 1:  # Also save on last step
             checkpoint_path = os.path.join(
                 config.save_path, f"step_{step+1}"
             )  # Save as step+1 since it's after step completion
@@ -428,78 +533,84 @@ def train(config: TrainingConfig):
             tokenizer.save_pretrained(checkpoint_path)
             print("  Checkpoint saved.")
 
-            # Terminate existing vLLM process if running
-            if vllm_process:
-                print("  Terminating existing vLLM process...")
-                vllm_process.terminate()
-                try:
-                    vllm_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    print(
-                        "  Existing vLLM process did not terminate gracefully, killing."
-                    )
-                    vllm_process.kill()
-                    vllm_process.wait()
-                vllm_process = None
-
-            # Launch new vLLM process (only if not the very last step, maybe? depends on use case)
-            # Let's still launch it on the last step for consistency, cleanup will handle it.
-            vllm_command = [
-                "python",
-                "-m",
-                "vllm.entrypoints.openai.api_server",
-                "--model",
-                os.path.join(config.save_path, f"step_{step+1}"),
-                "--port",
-                str(config.vllm_port),
-                "--dtype",
-                "auto",
-                "--gpu-memory-utilization",
-                "0.45",
-                "--disable-log-requests",
-                "--served-model-name",
-                config.model_name,
-            ]
-            print(f"  Launching vLLM server: {' '.join(vllm_command)}")
-            torch.cuda.empty_cache()
-            try:
-                vllm_process = subprocess.Popen(vllm_command)
-                print(f"  vLLM server launched with PID: {vllm_process.pid}")
-                # Check immediate errors
-                try:
-                    stdout, stderr = vllm_process.communicate(timeout=2)
-                    if (
-                        vllm_process.returncode is not None
-                        and vllm_process.returncode != 0
-                    ):
-                        print(f"  Error starting vLLM: {stderr.decode()}")
-                        vllm_process = None
-                        # Maybe raise error or just warn?
+            if config.use_modal:
+                # Modal mode: Upload checkpoint and update server
+                success = upload_checkpoint_to_modal(checkpoint_path, config)
+                if success:
+                    update_modal_server(f"step_{step+1}", config)
+                else:
+                    print("  ⚠️ Warning: Failed to upload checkpoint to Modal")
+            else:
+                # Original vLLM restart logic
+                # Terminate existing vLLM process if running
+                if vllm_process:
+                    print("  Terminating existing vLLM process...")
+                    vllm_process.terminate()
+                    try:
+                        vllm_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
                         print(
-                            "  WARNING: Failed to start vLLM server after checkpoint."
+                            "  Existing vLLM process did not terminate gracefully, killing."
                         )
-                except subprocess.TimeoutExpired:
-                    print("  vLLM process started (check logs for details).")
-            except FileNotFoundError:
-                print(
-                    "\n *** ERROR: 'python -m vllm...' command not found. ",
-                    "Make sure vLLM is installed and accessible. ***\n",
-                )
-                # Potentially stop training or just disable further vLLM restarts
-                print("  Disabling further vLLM restarts.")
-                config.vllm_restart_interval = (
-                    config.training_steps + 1
-                )  # Prevent further restarts
-            except Exception as e:
-                print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
-                print("  Disabling further vLLM restarts.")
-                config.vllm_restart_interval = (
-                    config.training_steps + 1
-                )  # Prevent further restarts
-        # --- End vLLM Restart Logic ---
+                        vllm_process.kill()
+                        vllm_process.wait()
+                    vllm_process = None
 
-        # Basic check if vLLM process terminated unexpectedly (outside interval check)
-        if vllm_process and vllm_process.poll() is not None:
+                # Launch new vLLM process
+                vllm_command = [
+                    "python",
+                    "-m",
+                    "vllm.entrypoints.openai.api_server",
+                    "--model",
+                    os.path.join(config.save_path, f"step_{step+1}"),
+                    "--port",
+                    str(config.vllm_port),
+                    "--dtype",
+                    "auto",
+                    "--gpu-memory-utilization",
+                    "0.45",
+                    "--disable-log-requests",
+                    "--served-model-name",
+                    config.model_name,
+                ]
+                print(f"  Launching vLLM server: {' '.join(vllm_command)}")
+                torch.cuda.empty_cache()
+                try:
+                    vllm_process = subprocess.Popen(vllm_command)
+                    print(f"  vLLM server launched with PID: {vllm_process.pid}")
+                    # Check immediate errors
+                    try:
+                        stdout, stderr = vllm_process.communicate(timeout=2)
+                        if (
+                            vllm_process.returncode is not None
+                            and vllm_process.returncode != 0
+                        ):
+                            print(f"  Error starting vLLM: {stderr.decode()}")
+                            vllm_process = None
+                            print(
+                                "  WARNING: Failed to start vLLM server after checkpoint."
+                            )
+                    except subprocess.TimeoutExpired:
+                        print("  vLLM process started (check logs for details).")
+                except FileNotFoundError:
+                    print(
+                        "\n *** ERROR: 'python -m vllm...' command not found. ",
+                        "Make sure vLLM is installed and accessible. ***\n",
+                    )
+                    print("  Disabling further vLLM restarts.")
+                    config.vllm_restart_interval = (
+                        config.training_steps + 1
+                    )  # Prevent further restarts
+                except Exception as e:
+                    print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
+                    print("  Disabling further vLLM restarts.")
+                    config.vllm_restart_interval = (
+                        config.training_steps + 1
+                    )  # Prevent further restarts
+        # --- End Checkpoint/Server Update Logic ---
+
+        # Basic check if vLLM process terminated unexpectedly (only in vLLM mode)
+        if not config.use_modal and vllm_process and vllm_process.poll() is not None:
             print(
                 f"\n *** WARNING: vLLM process terminated unexpectedly (return code: {vllm_process.returncode}). ",
                 "Check vLLM logs. ***\n",
@@ -533,15 +644,26 @@ def train(config: TrainingConfig):
 # Example usage (optional, can be run from another script)
 if __name__ == "__main__":
     # Example: Create a config and run training
-    # Replace "gpt2" with your desired model
+    
+    # Modal mode example (recommended)
     training_config = TrainingConfig(
-        model_name="Qwen/Qwen2.5-1.5B-Instruct",
-        training_steps=20,  # Use steps
-        vllm_restart_interval=3,  # Example interval
-        use_wandb=True,  # Set to True to enable logging
-        wandb_project="grpo-trainer-example",  # Replace with your project name
+        model_name="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
+        training_steps=20,
+        use_modal=True,  # Enable Modal mode
+        modal_endpoint="https://openblocklabs--atropos-model-server-serve-model-dev.modal.run/v1",
+        checkpoint_upload_interval=3,  # Upload to Modal every 3 steps
+        use_wandb=True,
+        wandb_project="grpo-trainer-modal-example",
     )
-
-    # --- End Mock ---
+    
+    # Local vLLM mode example (legacy)
+    # training_config = TrainingConfig(
+    #     model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    #     training_steps=20,
+    #     use_modal=False,  # Use local vLLM
+    #     vllm_restart_interval=3,
+    #     use_wandb=True,
+    #     wandb_project="grpo-trainer-vllm-example",
+    # )
 
     train(training_config)

@@ -19,7 +19,8 @@ import numpy as np
 import wandb
 import yaml
 from pydantic import BaseModel, Field
-from pydantic_cli import Cmd, FailedExecutionException, run_and_exit
+from pydantic_cli.core import Cmd
+from pydantic_cli.argparse import FailedExecutionException
 from rich import print as rprint
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from transformers import AutoTokenizer
@@ -1391,3 +1392,11 @@ class BaseEnv(ABC):
                     asyncio.run(env.process_manager())
 
         return CliProcessConfig
+
+# Create run_and_exit function for compatibility (not provided in new pydantic-cli)
+def run_and_exit(cmd_instance):
+    """Compatibility function for run_and_exit"""
+    try:
+        cmd_instance.run()
+    except Exception as e:
+        raise FailedExecutionException(str(e))
