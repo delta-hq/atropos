@@ -1,5 +1,6 @@
 import asyncio
 import warnings
+import logging
 
 import aiohttp
 import openai
@@ -59,6 +60,16 @@ class OpenAIServer(APIServer):
         assert (
             kwargs.get("messages", None) is not None
         ), "Messages are required for chat completion!"
+        
+        # Fix for vLLM: If n > 1 and temperature is 0, set temperature to 0.1
+        # This prevents vLLM from returning HTTP 400 error "n must be 1 when using greedy sampling"
+        n = kwargs.get("n", 1)
+        temperature = kwargs.get("temperature", 0.0)
+        if n > 1 and temperature == 0.0:
+            kwargs["temperature"] = 0.1
+            logger = logging.getLogger("OpenAIServer")
+            logger.info(f"Set temperature=0.1 for chat completion n={n} (vLLM requires temperature > 0 for n > 1)")
+        
         if self.config.n_kwarg_is_ignored:
             n = kwargs.pop("n", 1)
             completion_list = await asyncio.gather(
@@ -104,6 +115,16 @@ class OpenAIServer(APIServer):
         assert (
             kwargs.get("prompt", None) is not None
         ), "Prompt is required for completion!"
+        
+        # Fix for vLLM: If n > 1 and temperature is 0, set temperature to 0.1
+        # This prevents vLLM from returning HTTP 400 error "n must be 1 when using greedy sampling"
+        n = kwargs.get("n", 1)
+        temperature = kwargs.get("temperature", 0.0)
+        if n > 1 and temperature == 0.0:
+            kwargs["temperature"] = 0.1
+            logger = logging.getLogger("OpenAIServer")
+            logger.info(f"Set temperature=0.1 for completion n={n} (vLLM requires temperature > 0 for n > 1)")
+        
         if self.config.n_kwarg_is_ignored:
             n = kwargs.pop("n", 1)
             completion_list = await asyncio.gather(
@@ -128,7 +149,10 @@ class OpenAIServer(APIServer):
                     warnings.warn("n kwarg is ignored by the API, setting to True")
                     self.config.n_kwarg_is_ignored = True
                     completion_list = await asyncio.gather(
-                        *[self.openai.completions.create(**kwargs) for _ in range(1, n)]
+                        *[
+                            self.openai.completions.create(**kwargs)
+                            for _ in range(1, n)
+                        ]
                     )
                     for c in completion_list:
                         completions.choices.extend(c.choices)

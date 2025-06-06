@@ -3,6 +3,7 @@ import inspect
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List, Union
+import logging
 
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.completion import Completion
@@ -205,6 +206,7 @@ class ServerManager:
 
     async def completion(self, **kwargs) -> Completion:
         n = kwargs.get("n", 1)
+        
         if n > self.max_n_completions:
             # Split into multiple completions
             completions = []
@@ -220,6 +222,7 @@ class ServerManager:
             for completion in completions[1:]:
                 out.choices.extend(completion.choices)
             return out
+        
         is_train = kwargs.get("split", "train") == "train"
         most_available_server = 0
         most_available_server_num_slots = -1
@@ -234,6 +237,7 @@ class ServerManager:
                 most_available_server_num_slots = (
                     server.sem._value if is_train else server.eval_sem._value
                 )
+        
         return await self.servers[most_available_server].completion(**kwargs)
 
     @asynccontextmanager
