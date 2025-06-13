@@ -401,14 +401,20 @@ class BaseEnv(ABC):
                         data = await parse_http_response(resp, logger)
                         self.wandb_group = data["group"]
                         self.wandb_project = data["project"]
+                        self.wandb_custom_name = data.get("name")  # Get custom name from API
                 if self.wandb_project is None:
                     await asyncio.sleep(1)
                 else:
-                    wandb.init(
-                        project=self.wandb_project,
-                        group=self.wandb_group,
-                        config=self.config.model_dump(),
-                    )
+                    # Use custom name if provided, otherwise let WandB auto-generate
+                    wandb_kwargs = {
+                        "project": self.wandb_project,
+                        "group": self.wandb_group,
+                        "config": self.config.model_dump(),
+                    }
+                    if self.wandb_custom_name:
+                        wandb_kwargs["name"] = self.wandb_custom_name
+                    
+                    wandb.init(**wandb_kwargs)
                     break
 
     @retry(
